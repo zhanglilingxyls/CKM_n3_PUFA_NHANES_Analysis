@@ -1,0 +1,111 @@
+
+**文件2: `weighted_cox_analysis.R`**
+```r
+# =============================================================================
+# WEIGHTED COX PROPORTIONAL HAZARDS MODELS
+# Analysis for: Higher Dietary Omega-3 Fatty Acid Intake and CKM Syndrome Mortality
+# NHANES 1999-2018
+# =============================================================================
+
+# Load required packages
+library(survival)
+library(survey)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(broom)
+library(ggplot2)
+
+run_weighted_cox_analysis <- function(data_path, outcome_vars) {
+  # Read and preprocess data
+  df_complete <- readr::read_csv(data_path)
+  
+  # Variable selection and preprocessing
+  analysis_vars <- c("Age", "Gender", "race", "Education_level.cat", "Marital_status.cat", 
+                     "PIR.cat", "Physical_activity_F3_2", "smoking_status_numeric", 
+                     "drinking_status_factor", "Nutrient_supplement_use_status", "BMI",
+                     "Cancer", "lipid_meds", "Energy", "Protein", "Dietary_fiber", 
+                     "TSFAT", "Carbohydrate", "b6", "n3", "CKM_stage1.0", "time_exm",
+                     "SDMVPSU", "SDMVSTRA", "nhs_wt.DR2D", outcome_vars)
+  
+  df_clean <- df_complete %>%
+    dplyr::select(all_of(analysis_vars)) %>%
+    mutate(across(c(Gender, race, Education_level.cat, Marital_status.cat, PIR.cat,
+                    smoking_status_numeric, drinking_status_factor, Physical_activity_F3_2,
+                    Nutrient_supplement_use_status, Cancer, lipid_meds, CKM_stage1.0),
+                  as.factor))
+  
+  # Define population subgroups
+  population_groups <- list(
+    list(name = "Overall", filter_expr = expr(TRUE)),
+    list(name = "CKM_stage1_2", filter_expr = expr(CKM_stage1.0 %in% c(1, 2))),
+    list(name = "CKM_stage3_4", filter_expr = expr(CKM_stage1.0 %in% c(3, 4)))
+  )
+  
+  # Main analysis function
+  run_weighted_cox <- function(formula, design) {
+    model <- svycoxph(formula, design = design)
+    tidy_model <- broom::tidy(model, conf.int = TRUE, exponentiate = TRUE) %>%
+      dplyr::select(term, estimate, conf.low, conf.high, p.value)
+    
+    tidy_model %>%
+      mutate(
+        HR_CI = sprintf("%.2f (%.2f-%.2f)", estimate, conf.low, conf.high),
+        p_str = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))
+      )
+  }
+  
+  # Analysis loop across subgroups and outcomes
+  results_list <- list()
+  
+  for(outcome_var in outcome_vars) {
+    for(group in population_groups) {
+      group_data <- df_clean %>% filter(!!group$filter_expr)
+      
+      # Calculate quartiles and create exposure variables
+      quartiles <- quantile(group_data$n3, probs = c(0, 0.25, 0.50, 0.75, 1), na.rm = TRUE)
+      
+      group_data <- group_data %>%
+        mutate(
+          n3_4 = cut(n3, breaks = quartiles, labels = c("Q1", "Q2", "Q3", "Q4"),
+                     include.lowest = TRUE),
+          n3_per10_unit = n3 / 10,
+          n3_4_ord = as.numeric(n3_4)
+        ) %>%
+        mutate(n3_4 = relevel(n3_4, ref = "Q1"))
+      
+      # Create survey design
+      group_design <- svydesign(
+        ids = ~ SDMVPSU,
+        strata = ~ SDMVSTRA,
+        weights = ~ nhs_wt.DR2D,
+        data = group_data,
+        nest = TRUE
+      )
+      
+      # Continuous exposure models
+      models_continuous <- list(
+        model1 = as.formula(sprintf("Surv(time_exm, %s) ~ n3_per10_unit", outcome_var)),
+        model2 = as.formula(sprintf("Surv(time_exm, %s) ~ n3_per10_unit + Gender + Age + Education_level.cat + race + Marital_status.cat + PIR.cat", outcome_var)),
+        model3 = as.formula(sprintf("Surv(time_exm, %s) ~ n3_per10_unit + Gender + Age + Education_level.cat + race + Marital_status.cat + PIR.cat + smoking_status_numeric + drinking_status_factor + Physical_activity_F3_2", outcome_var)),
+        model4 = as.formula(sprintf("Surv(time_exm, %s) ~ n3_per10_unit + scale(b6) + scale(Energy) + scale(Protein) + scale(TSFAT) + scale(Carbohydrate) + scale(Dietary_fiber) + Gender + Age + Education_level.cat + race + Marital_status.cat + PIR.cat + smoking_status_numeric + drinking_status_factor + Physical_activity_F3_2 + Nutrient_supplement_use_status + Cancer + lipid_meds + BMI", outcome_var))
+      )
+      
+      # Run analyses and store results
+      cont_results <- purrr::map_dfr(models_continuous, ~ {
+        run_weighted_cox(.x, design = group_design) %>%
+          filter(str_detect(term, "n3_per10_unit"))
+      }, .id = "model")
+      
+      # Store results with metadata
+      results_list[[paste(outcome_var, group$name, "continuous", sep = "_")]] <- 
+        cont_results %>% mutate(outcome = outcome_var, group = group$name, analysis = "continuous")
+    }
+  }
+  
+  return(dplyr::bind_rows(results_list))
+}
+
+# Example usage (commented out):
+# results <- run_weighted_cox_analysis("nhanes_data.csv", 
+#                                     c("all_cause_mort", "cvd_mort", "non_cvd_mort"))
